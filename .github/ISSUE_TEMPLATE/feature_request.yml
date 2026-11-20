@@ -1,0 +1,40 @@
+name: Feature or hardware proposal
+description: Propose scoped development or another hardware target
+title: "[Proposal]: "
+labels: [enhancement, needs-triage]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and user value
+      description: What workload or interoperable behavior is needed?
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed scope and non-goals
+      description: Include API/format/WSI/memory/synchronization boundaries and affected hardware
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance and verification
+      description: Public source tests, negative cases, hardware evidence, performance and rollback gates
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Current evidence
+      description: Separate implemented/tested behavior from plans; include commits and environment if available
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Proposal checks
+      options:
+        - label: I have reviewed ROADMAP.md and will not claim an untested capability
+          required: true
+        - label: Other developers and hardware targets are not excluded without a technical reason
+          required: true

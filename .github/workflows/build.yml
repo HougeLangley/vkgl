@@ -1,0 +1,37 @@
+name: build-and-host-test
+
+on:
+  push:
+    branches: [main, "experimental/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install public build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ gcc pkg-config python3 \
+            libwayland-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libgbm-dev libvulkan-dev
+      - name: Build and run host-unit tests
+        run: scripts/test-host.sh build/host -G Ninja -DVKGL_FETCH_SPIRV_CROSS=ON
+      - name: Verify clean-build reproducibility
+        run: scripts/reproduce-build.sh "$PWD/build/repro-a" "$PWD/build/repro-b" -G Ninja -DVKGL_FETCH_SPIRV_CROSS=ON
+  source-policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Offline secret scan
+        run: python3 scripts/check_secrets.py .

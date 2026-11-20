@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible vkgl correctness or build problem
+title: "[Bug]: "
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report vulnerabilities here; use SECURITY.md. Remove credentials,
+        private paths, personal data, device serials, and unrelated memory/GPU data.
+  - type: input
+    id: commit
+    attributes:
+      label: Branch and full commit
+      placeholder: main / full 40-character commit
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Architecture, GPU, OS/kernel, compiler, Wayland/EGL/GBM, SPIRV-Cross provider/version
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Exact public source, configure/build/install/test commands, and staged manifest selection
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and relevant redacted output
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: Test lanes
+      description: Host-unit, hardware, reproducibility; say not run where applicable
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Report hygiene
+      options:
+        - label: This contains no secrets, private paths, large binaries, or fabricated capability claims
+          required: true
+        - label: This is not a request to overwrite a production ICD during diagnosis
+          required: true
