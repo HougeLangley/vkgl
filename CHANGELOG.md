@@ -4,6 +4,24 @@ All notable changes to this standalone source tree are documented here. The
 format follows Keep a Changelog and versions describe source releases, not
 unverified capability claims.
 
+## [0.1.36-external-dmabuf.0] - Unreleased
+
+### Added
+
+- Experimental single-plane linear dma-buf import candidate and its public
+  positive/negative LG110 client, source hashes, and hardware entry point.
+- Independent functional-validation scope and explicit unsupported boundaries
+  in `EXTERNAL_DMABUF.md`.
+
+### Performance and release boundary
+
+- The measured candidate workload median was approximately 15.35% slower than
+  baseline. The regression is disclosed and remains a release gate.
+- Functionality was independently verified only for the documented narrow
+  scope. This candidate has not been released to production and does not add
+  VPU/YUV/Vulkan Video, export, external synchronization, tiled layouts, or
+  full zero-copy.
+
 ## [0.1.36] - 2026-11-20
 
 ### Added

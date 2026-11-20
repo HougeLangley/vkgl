@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <new>
 #include <atomic>
 #include <vector>
 #include <unordered_map>
@@ -259,6 +260,8 @@ struct Queue : Obj {
    uint32_t family = 0;
 };
 
+struct Image;
+
 struct Memory : Obj {
    VkDeviceSize size = 0;
    uint32_t type_index = 0;
@@ -272,6 +275,10 @@ struct Memory : Obj {
    bool bound_image = false;
    bool mapped = false;
    uint64_t revision = 1;
+   // Imported dma-buf: the driver owns external_fd after successful allocation.
+   int external_fd = -1;
+   VkExternalMemoryHandleTypeFlagBits external_handle_type = (VkExternalMemoryHandleTypeFlagBits)0;
+   Image *dedicated_image = nullptr;
 };
 
 static uint64_t g_submit_serial = 0;
@@ -301,6 +308,14 @@ struct Image : Obj {
    uint64_t uploaded_submit = 0;
    GLenum sampler_mag = GL_NEAREST, sampler_min = GL_NEAREST;
    GLenum sampler_wrap_s = GL_CLAMP_TO_EDGE, sampler_wrap_t = GL_CLAMP_TO_EDGE;
+   // Minimal external dedicated single-plane LINEAR dma-buf layout.
+   bool external_dmabuf = false;
+   uint64_t external_modifier = 0;
+   VkDeviceSize external_row_pitch = 0;
+   VkDeviceSize external_offset = 0;
+   VkDeviceSize external_size = 0;
+   VkDeviceSize external_allocation_size = 0;
+   EGLImageKHR external_egl_image = EGL_NO_IMAGE_KHR;
 };
 
 struct ImageView : Obj {
@@ -547,6 +562,7 @@ static void ensure_gl_buffer(Buffer *b) {
 
 static void ensure_gl_texture(Image *im) {
    if (im->tex) return;
+   if (im->external_dmabuf) return; // external textures are created only by BindImageMemory
    GlCtx::get().make_current();
    glGenTextures(1, &im->tex);
    glBindTexture(GL_TEXTURE_2D, im->tex);
@@ -578,6 +594,7 @@ static void ensure_fbo(Image *im) {
    if (im->fbo) return;
    GlCtx::get().make_current();
    ensure_gl_texture(im);
+   if (!im->tex) return;
    glGenFramebuffers(1, &im->fbo);
    glBindFramebuffer(GL_FRAMEBUFFER, im->fbo);
    if (im->format == VK_FORMAT_D16_UNORM || im->format == VK_FORMAT_D32_SFLOAT ||
@@ -633,6 +650,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkgl_EnumerateInstanceExtensionProperties(
       {"VK_KHR_xlib_surface", 6},
       {"VK_EXT_debug_report", 10},
       {"VK_KHR_get_surface_capabilities2", 1},
+      {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_SPEC_VERSION},
+      {VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_SPEC_VERSION},
    };
    uint32_t n = sizeof(exts) / sizeof(exts[0]);
    if (!props) { *count = n; return VK_SUCCESS; }
@@ -654,6 +673,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkgl_EnumerateDeviceExtensionProperties(
       {"VK_KHR_swapchain", 70},
       {"VK_KHR_maintenance1", 2},
       {"VK_KHR_image_format_list", 1},
+      {VK_KHR_BIND_MEMORY_2_EXTENSION_NAME, VK_KHR_BIND_MEMORY_2_SPEC_VERSION},
+      {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_GET_MEMORY_REQUIREMENTS_2_SPEC_VERSION},
+      {VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_SPEC_VERSION},
+      {VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_SPEC_VERSION},
+      {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_FD_SPEC_VERSION},
+      {VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_SPEC_VERSION},
+      /* Dependency-only: Features2 reports samplerYcbcrConversion=VK_FALSE and
+       * no format advertises Ycbcr/chroma features. Creation is rejected. */
+      {VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME, VK_KHR_SAMPLER_YCBCR_CONVERSION_SPEC_VERSION},
+      {VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_SPEC_VERSION},
    };
    uint32_t n = sizeof(exts) / sizeof(exts[0]);
    if (!props) { *count = n; return VK_SUCCESS; }
@@ -834,16 +863,43 @@ static VKAPI_ATTR void VKAPI_CALL vkgl_GetPhysicalDeviceQueueFamilyProperties(
 static VKAPI_ATTR void VKAPI_CALL vkgl_GetPhysicalDeviceMemoryProperties(
    VkPhysicalDevice, VkPhysicalDeviceMemoryProperties *mp) {
    memset(mp, 0, sizeof(*mp));
-   mp->memoryTypeCount = 2;
+   mp->memoryTypeCount = 3;
    mp->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
    mp->memoryTypes[0].heapIndex = 0;
    mp->memoryTypes[1].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
    mp->memoryTypes[1].heapIndex = 0;
+   // Imported dma-buf is intentionally not host-visible/mappable.
+   mp->memoryTypes[2].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+   mp->memoryTypes[2].heapIndex = 0;
    mp->memoryHeapCount = 1;
    mp->memoryHeaps[0].size = 256ull * 1024 * 1024;
    mp->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+}
+
+static bool external_format_supported(VkFormat format) {
+   return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+static bool external_usage_supported(VkImageUsageFlags usage) {
+   const VkImageUsageFlags allowed = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+   return usage != 0 && (usage & ~allowed) == 0;
+}
+
+static bool external_image_combo_supported(VkFormat format, VkImageType type, VkImageTiling tiling,
+                                           VkImageUsageFlags usage, VkImageCreateFlags flags,
+                                           VkExternalMemoryHandleTypeFlagBits handle_type,
+                                           uint64_t modifier) {
+   return external_format_supported(format) && type == VK_IMAGE_TYPE_2D &&
+      tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && external_usage_supported(usage) &&
+      flags == 0 && handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT && modifier == 0;
+}
+
+static uint32_t external_drm_fourcc(VkFormat format) {
+   if (format == VK_FORMAT_B8G8R8A8_UNORM) return GBM_FORMAT_ARGB8888; // AR24: memory B,G,R,A
+   if (format == VK_FORMAT_R8G8B8A8_UNORM) return GBM_FORMAT_ABGR8888; // AB24: memory R,G,B,A
+   return 0;
 }
 
 static VKAPI_ATTR void VKAPI_CALL vkgl_GetPhysicalDeviceFormatProperties(
@@ -874,9 +930,12 @@ static VKAPI_ATTR void VKAPI_CALL vkgl_GetPhysicalDeviceFormatProperties(
       p->optimalTilingFeatures = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
       p->linearTilingFeatures = p->optimalTilingFeatures;
       break;
-   default:
+   case VK_FORMAT_R16G16B16A16_SFLOAT:
       p->optimalTilingFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
       p->linearTilingFeatures = p->optimalTilingFeatures;
+      break;
+   default:
+      /* Do not let an unknown/YUV format inherit sampled support by accident. */
       break;
    }
 }
@@ -956,6 +1015,58 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkgl_QueueWaitIdle(VkQueue) {
 // ---------------------------------------------------------------------------
 static VKAPI_ATTR VkResult VKAPI_CALL vkgl_AllocateMemory(VkDevice, const VkMemoryAllocateInfo *ai,
                                                           const VkAllocationCallbacks *, VkDeviceMemory *out) {
+   const VkImportMemoryFdInfoKHR *import = nullptr;
+   const VkMemoryDedicatedAllocateInfo *dedicated = nullptr;
+   bool export_requested = false, unknown_chain = false;
+   if (!ai || !out) return VK_ERROR_OUT_OF_HOST_MEMORY;
+   *out = VK_NULL_HANDLE;
+   for (const void *next = ai->pNext; next;) {
+      const auto *base = (const VkBaseInStructure *)next;
+      next = base->pNext;
+      if (base->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR) {
+         if (import) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         import = (const VkImportMemoryFdInfoKHR *)base;
+      } else if (base->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) {
+         if (dedicated) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         dedicated = (const VkMemoryDedicatedAllocateInfo *)base;
+      } else if (base->sType == VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO) {
+         export_requested = true;
+      } else {
+         unknown_chain = true;
+      }
+   }
+   if (import) {
+      /* All failure exits before close() preserve the caller's fd. */
+      if (export_requested || unknown_chain || !dedicated || dedicated->buffer != VK_NULL_HANDLE ||
+          dedicated->image == VK_NULL_HANDLE || import->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ||
+          import->fd < 0 || ai->memoryTypeIndex != 2)
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      auto *im = from_handle<Image>((uint64_t)dedicated->image);
+      if (!im || !im->external_dmabuf || ai->allocationSize != im->external_allocation_size ||
+          fcntl(import->fd, F_GETFD) < 0)
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      int owned_fd = fcntl(import->fd, F_DUPFD_CLOEXEC, 0);
+      if (owned_fd < 0) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      auto *m = new (std::nothrow) Memory();
+      if (!m) { close(owned_fd); return VK_ERROR_OUT_OF_HOST_MEMORY; }
+      m->type = VK_OBJECT_TYPE_DEVICE_MEMORY;
+      m->size = ai->allocationSize;
+      m->type_index = ai->memoryTypeIndex;
+      m->props = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+      m->host_visible = false;
+      m->external_fd = owned_fd;
+      m->external_handle_type = import->handleType;
+      m->dedicated_image = im;
+      if (close(import->fd) != 0) {
+         close(owned_fd);
+         delete m;
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      }
+      *out = (VkDeviceMemory)to_handle(m);
+      reg(m, *out);
+      return VK_SUCCESS;
+   }
+
    auto *m = new Memory();
    m->type = VK_OBJECT_TYPE_DEVICE_MEMORY;
    m->size = ai->allocationSize;
@@ -973,6 +1084,8 @@ static VKAPI_ATTR void VKAPI_CALL vkgl_FreeMemory(VkDevice, VkDeviceMemory mem, 
    GlCtx::get().make_current();
    if (m->gl_buffer) glDeleteBuffers(1, &m->gl_buffer);
    if (m->gl_texture) glDeleteTextures(1, &m->gl_texture);
+   if (m->external_fd >= 0) close(m->external_fd);
+   m->external_fd = -1;
    unreg((uint64_t)mem);
    delete m;
 }
@@ -980,6 +1093,7 @@ static VKAPI_ATTR void VKAPI_CALL vkgl_FreeMemory(VkDevice, VkDeviceMemory mem, 
 static VKAPI_ATTR VkResult VKAPI_CALL vkgl_MapMemory(VkDevice, VkDeviceMemory mem, VkDeviceSize off,
                                                      VkDeviceSize size, VkMemoryMapFlags, void **ptr) {
    auto *m = from_handle<Memory>((uint64_t)mem);
+   if (m->external_fd >= 0) return VK_ERROR_MEMORY_MAP_FAILED;
    if (off >= m->size) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    if (size == VK_WHOLE_SIZE || off + size > m->size) size = m->size - off;
    m->mapped = true;
@@ -1008,9 +1122,66 @@ static VKAPI_ATTR void VKAPI_CALL vkgl_GetBufferMemoryRequirements(VkDevice, VkB
 
 static VKAPI_ATTR void VKAPI_CALL vkgl_GetImageMemoryRequirements(VkDevice, VkImage img, VkMemoryRequirements *r) {
    auto *im = from_handle<Image>((uint64_t)img);
-   r->size = (VkDeviceSize)im->extent.width * im->extent.height * 4;
-   r->alignment = 64;
-   r->memoryTypeBits = 0x3;
+   r->size = im->external_dmabuf ? im->external_allocation_size :
+      (VkDeviceSize)im->extent.width * im->extent.height * 4;
+   r->alignment = im->external_dmabuf ? 4096 : 64;
+   r->memoryTypeBits = im->external_dmabuf ? 0x4 : 0x3;
+}
+
+static VKAPI_ATTR void VKAPI_CALL vkgl_GetBufferMemoryRequirements2KHR(
+   VkDevice dev, const VkBufferMemoryRequirementsInfo2 *info, VkMemoryRequirements2 *out) {
+   vkgl_GetBufferMemoryRequirements(dev, info->buffer, &out->memoryRequirements);
+}
+
+static VKAPI_ATTR void VKAPI_CALL vkgl_GetImageMemoryRequirements2KHR(
+   VkDevice dev, const VkImageMemoryRequirementsInfo2 *info, VkMemoryRequirements2 *out) {
+   vkgl_GetImageMemoryRequirements(dev, info->image, &out->memoryRequirements);
+   auto *im = from_handle<Image>((uint64_t)info->image);
+   for (void *next = out->pNext; next;) {
+      auto *base = (VkBaseOutStructure *)next;
+      next = base->pNext;
+      if (base->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+         auto *dedicated = (VkMemoryDedicatedRequirements *)base;
+         dedicated->prefersDedicatedAllocation = im && im->external_dmabuf ? VK_TRUE : VK_FALSE;
+         dedicated->requiresDedicatedAllocation = im && im->external_dmabuf ? VK_TRUE : VK_FALSE;
+      }
+   }
+}
+
+static VKAPI_ATTR void VKAPI_CALL vkgl_GetImageSparseMemoryRequirements2KHR(
+   VkDevice, const VkImageSparseMemoryRequirementsInfo2 *, uint32_t *count, VkSparseImageMemoryRequirements2 *) {
+   *count = 0;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL vkgl_GetMemoryFdPropertiesKHR(
+   VkDevice, VkExternalMemoryHandleTypeFlagBits handle_type, int fd, VkMemoryFdPropertiesKHR *props) {
+   if (handle_type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT || fd < 0 || !props ||
+       fcntl(fd, F_GETFD) < 0)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   char path[64], target[256];
+   snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+   ssize_t n = readlink(path, target, sizeof(target) - 1);
+   if (n < 0) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   target[n] = '\0';
+   if (strncmp(target, "/dmabuf:", 8) != 0) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   props->memoryTypeBits = 0x4;
+   return VK_SUCCESS;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL vkgl_GetMemoryFdKHR(
+   VkDevice, const VkMemoryGetFdInfoKHR *info, int *fd) {
+   if (fd) *fd = -1;
+   if (!info || info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   return VK_ERROR_FEATURE_NOT_PRESENT; // this candidate is import-only
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL vkgl_GetImageDrmFormatModifierPropertiesEXT(
+   VkDevice, VkImage image, VkImageDrmFormatModifierPropertiesEXT *props) {
+   auto *im = from_handle<Image>((uint64_t)image);
+   if (!im || !im->external_dmabuf || !props) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   props->drmFormatModifier = im->external_modifier;
+   return VK_SUCCESS;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL vkgl_CreateBuffer(VkDevice, const VkBufferCreateInfo *ci,
@@ -1034,6 +1205,7 @@ static VKAPI_ATTR void VKAPI_CALL vkgl_DestroyBuffer(VkDevice, VkBuffer buf, con
 static VKAPI_ATTR VkResult VKAPI_CALL vkgl_BindBufferMemory(VkDevice, VkBuffer buf, VkDeviceMemory mem, VkDeviceSize off) {
    auto *b = from_handle<Buffer>((uint64_t)buf);
    b->mem = from_handle<Memory>((uint64_t)mem);
+   if (b->mem->external_fd >= 0) { b->mem = nullptr; return VK_ERROR_INVALID_EXTERNAL_HANDLE; }
    b->mem_offset = off;
    b->uploaded_revision = 0;
    ensure_gl_buffer(b);
@@ -1042,7 +1214,67 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkgl_BindBufferMemory(VkDevice, VkBuffer b
 
 static VKAPI_ATTR VkResult VKAPI_CALL vkgl_CreateImage(VkDevice, const VkImageCreateInfo *ci,
                                                        const VkAllocationCallbacks *, VkImage *out) {
+   const VkExternalMemoryImageCreateInfo *external = nullptr;
+   const VkImageDrmFormatModifierExplicitCreateInfoEXT *explicit_layout = nullptr;
+   bool modifier_list = false, unknown_chain = false;
+   if (!ci || !out) return VK_ERROR_OUT_OF_HOST_MEMORY;
+   *out = VK_NULL_HANDLE;
+   for (const void *next = ci->pNext; next;) {
+      const auto *base = (const VkBaseInStructure *)next;
+      next = base->pNext;
+      if (base->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
+         if (external) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+         external = (const VkExternalMemoryImageCreateInfo *)base;
+      } else if (base->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT) {
+         if (explicit_layout) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+         explicit_layout = (const VkImageDrmFormatModifierExplicitCreateInfoEXT *)base;
+      } else if (base->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT) {
+         modifier_list = true;
+      } else {
+         unknown_chain = true;
+      }
+   }
    VKGL_LOG("CreateImage fmt=%d %ux%u tiling=%d usage=0x%x\n", ci->format, ci->extent.width, ci->extent.height, ci->tiling, ci->usage);
+   if (!external && (explicit_layout || modifier_list || ci->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (external) {
+      if (unknown_chain || modifier_list || !explicit_layout ||
+          external->handleTypes != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ||
+          !external_image_combo_supported(ci->format, ci->imageType, ci->tiling, ci->usage, ci->flags,
+                                          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                                          explicit_layout->drmFormatModifier) ||
+          ci->extent.width == 0 || ci->extent.height == 0 || ci->extent.depth != 1 ||
+          ci->mipLevels != 1 || ci->arrayLayers != 1 || ci->samples != VK_SAMPLE_COUNT_1_BIT ||
+          ci->sharingMode != VK_SHARING_MODE_EXCLUSIVE || ci->initialLayout != VK_IMAGE_LAYOUT_UNDEFINED ||
+          explicit_layout->drmFormatModifierPlaneCount != 1 || !explicit_layout->pPlaneLayouts)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      const VkSubresourceLayout &plane = explicit_layout->pPlaneLayouts[0];
+      /* VUID-...-02267/02268/02269: explicit input leaves these as zero. */
+      if (plane.size != 0 || plane.arrayPitch != 0 || plane.depthPitch != 0 ||
+          plane.rowPitch == 0 || (plane.rowPitch & 3) != 0 || (plane.offset & 3) != 0 ||
+          plane.rowPitch < (VkDeviceSize)ci->extent.width * 4)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      if (ci->extent.height > UINT64_MAX / plane.rowPitch ||
+          plane.offset > UINT64_MAX - plane.rowPitch * (VkDeviceSize)ci->extent.height)
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      auto *im = new (std::nothrow) Image();
+      if (!im) return VK_ERROR_OUT_OF_HOST_MEMORY;
+      im->type = VK_OBJECT_TYPE_IMAGE;
+      im->format = ci->format;
+      im->extent = ci->extent;
+      im->usage = ci->usage;
+      im->tiling = ci->tiling;
+      im->external_dmabuf = true;
+      im->external_modifier = 0;
+      im->external_row_pitch = plane.rowPitch;
+      im->external_offset = plane.offset;
+      im->external_size = plane.rowPitch * (VkDeviceSize)(ci->extent.height - 1) +
+         (VkDeviceSize)ci->extent.width * 4;
+      im->external_allocation_size = im->external_offset + im->external_size;
+      *out = (VkImage)to_handle(im);
+      reg(im, *out);
+      return VK_SUCCESS;
+   }
    auto *im = new Image();
    im->type = VK_OBJECT_TYPE_IMAGE;
    im->format = ci->format;
@@ -1056,16 +1288,84 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkgl_CreateImage(VkDevice, const VkImageCr
 
 static VKAPI_ATTR void VKAPI_CALL vkgl_DestroyImage(VkDevice, VkImage img, const VkAllocationCallbacks *) {
    auto *im = from_handle<Image>((uint64_t)img);
-   GlCtx::get().make_current();
+   GlCtx &g = GlCtx::get();
+   g.make_current();
    if (im->fbo) glDeleteFramebuffers(1, &im->fbo);
    if (im->tex) glDeleteTextures(1, &im->tex);
+   if (im->external_egl_image != EGL_NO_IMAGE_KHR) {
+      eglDestroyImage(g.dpy, im->external_egl_image);
+      im->external_egl_image = EGL_NO_IMAGE_KHR;
+   }
+   if (im->mem && im->mem->dedicated_image == im) im->mem->bound_image = false;
    unreg((uint64_t)img);
    delete im;
 }
 
+static VkResult import_external_gl(Image *im) {
+   GlCtx &g = GlCtx::get();
+   g.make_current();
+   if (!g.ok || !im->mem || im->mem->external_fd < 0) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   EGLAttrib attrs[] = {
+      EGL_WIDTH, (EGLAttrib)im->extent.width,
+      EGL_HEIGHT, (EGLAttrib)im->extent.height,
+      EGL_LINUX_DRM_FOURCC_EXT, (EGLAttrib)external_drm_fourcc(im->format),
+      EGL_DMA_BUF_PLANE0_FD_EXT, (EGLAttrib)im->mem->external_fd,
+      EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLAttrib)im->external_offset,
+      EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLAttrib)im->external_row_pitch,
+      EGL_NONE
+   };
+   while (eglGetError() != EGL_SUCCESS) {}
+   EGLImageKHR egl_image = eglCreateImage(g.dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
+   if (egl_image == EGL_NO_IMAGE_KHR) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   GLuint tex = 0, fbo = 0;
+   glGenTextures(1, &tex);
+   glBindTexture(GL_TEXTURE_2D, tex);
+   auto image_target = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+   if (!image_target) { eglDestroyImage(g.dpy, egl_image); glDeleteTextures(1, &tex); return VK_ERROR_INVALID_EXTERNAL_HANDLE; }
+   image_target(GL_TEXTURE_2D, (GLeglImageOES)egl_image);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+   im->gl_format = im->format == VK_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA;
+   im->gl_type = GL_UNSIGNED_BYTE;
+   glGenFramebuffers(1, &fbo);
+   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+   GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+   GLenum error = glGetError();
+   glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   glBindTexture(GL_TEXTURE_2D, 0);
+   if (status != GL_FRAMEBUFFER_COMPLETE || error != GL_NO_ERROR) {
+      if (fbo) glDeleteFramebuffers(1, &fbo);
+      if (tex) glDeleteTextures(1, &tex);
+      eglDestroyImage(g.dpy, egl_image);
+      return status == GL_FRAMEBUFFER_COMPLETE ? VK_ERROR_INVALID_EXTERNAL_HANDLE : VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
+   im->tex = tex;
+   im->fbo = fbo;
+   im->external_egl_image = egl_image;
+   return VK_SUCCESS;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL vkgl_BindImageMemory(VkDevice, VkImage img, VkDeviceMemory mem, VkDeviceSize off) {
    auto *im = from_handle<Image>((uint64_t)img);
-   im->mem = from_handle<Memory>((uint64_t)mem);
+   auto *m = from_handle<Memory>((uint64_t)mem);
+   if (!im || !m) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   if (im->external_dmabuf) {
+      if (off != 0 || m->external_fd < 0 || m->external_handle_type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ||
+          m->dedicated_image != im || im->mem)
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      im->mem = m;
+      im->mem_offset = 0;
+      im->uploaded_revision = 0;
+      VkResult result = import_external_gl(im);
+      if (result != VK_SUCCESS) { im->mem = nullptr; return result; }
+      m->bound_image = true;
+      return VK_SUCCESS;
+   }
+   if (m->external_fd >= 0) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   im->mem = m;
    im->mem_offset = off;
    im->uploaded_revision = 0;
    ensure_gl_texture(im);
@@ -1989,7 +2289,7 @@ static void execute_cmds(CommandBuffer *c) {
          glBindFramebuffer(GL_FRAMEBUFFER, 0);
          uint8_t *dst = buf->mem->shadow.data() + buf->mem_offset + r.bufferOffset;
          for (uint64_t y = 0; y < height; y++)
-            memcpy(dst + y * stride, pixels.data() + (height - 1 - y) * row_bytes, (size_t)row_bytes);
+            memcpy(dst + y * stride, pixels.data() + (im->external_dmabuf ? y : height - 1 - y) * row_bytes, (size_t)row_bytes);
          buf->mem->revision++;
          break;
       }
@@ -2535,8 +2835,24 @@ struct Entry { const char *name; void *fn; };
 
 /* ---- stubs for not-yet-implemented core entry points (keep the loader
  * from handing out NULL pointers; they are no-ops returning success) ---- */
-static VKAPI_ATTR VkResult VKAPI_CALL vkgl_BindBufferMemory2(void *a1, ...) { (void)a1; { return VK_SUCCESS; } }
-static VKAPI_ATTR VkResult VKAPI_CALL vkgl_BindImageMemory2(void *a1, ...) { (void)a1; { return VK_SUCCESS; } }
+static VKAPI_ATTR VkResult VKAPI_CALL vkgl_BindBufferMemory2(
+   VkDevice dev, uint32_t count, const VkBindBufferMemoryInfo *infos) {
+   for (uint32_t i = 0; i < count; ++i) {
+      if (infos[i].pNext) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      VkResult r = vkgl_BindBufferMemory(dev, infos[i].buffer, infos[i].memory, infos[i].memoryOffset);
+      if (r != VK_SUCCESS) return r;
+   }
+   return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL vkgl_BindImageMemory2(
+   VkDevice dev, uint32_t count, const VkBindImageMemoryInfo *infos) {
+   for (uint32_t i = 0; i < count; ++i) {
+      if (infos[i].pNext) return VK_ERROR_FORMAT_NOT_SUPPORTED; // no disjoint/multi-plane support
+      VkResult r = vkgl_BindImageMemory(dev, infos[i].image, infos[i].memory, infos[i].memoryOffset);
+      if (r != VK_SUCCESS) return r;
+   }
+   return VK_SUCCESS;
+}
 static VKAPI_ATTR void VKAPI_CALL vkgl_CmdBeginQuery(void *a1, ...) { (void)a1; { } }
 static VKAPI_ATTR void VKAPI_CALL vkgl_CmdBeginRenderPass2(void *a1, ...) { (void)a1; { } }
 static VKAPI_ATTR void VKAPI_CALL vkgl_CmdBeginRendering(void *a1, ...) { (void)a1; { } }
@@ -2634,7 +2950,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkgl_CreateComputePipelines(void *a1, ...)
 static VKAPI_ATTR VkResult VKAPI_CALL vkgl_CreateDescriptorUpdateTemplate(void *a1, ...) { (void)a1; { return VK_SUCCESS; } }
 static VKAPI_ATTR VkResult VKAPI_CALL vkgl_CreatePrivateDataSlot(void *a1, ...) { (void)a1; { return VK_SUCCESS; } }
 static VKAPI_ATTR VkResult VKAPI_CALL vkgl_CreateRenderPass2(void *a1, ...) { (void)a1; { return VK_SUCCESS; } }
-static VKAPI_ATTR VkResult VKAPI_CALL vkgl_CreateSamplerYcbcrConversion(void *a1, ...) { (void)a1; { return VK_SUCCESS; } }
+static VKAPI_ATTR VkResult VKAPI_CALL vkgl_CreateSamplerYcbcrConversion(
+   VkDevice, const VkSamplerYcbcrConversionCreateInfo *, const VkAllocationCallbacks *, VkSamplerYcbcrConversion *out) {
+   if (out) *out = VK_NULL_HANDLE;
+   return VK_ERROR_FORMAT_NOT_SUPPORTED; // samplerYcbcrConversion feature is VK_FALSE
+}
+static VKAPI_ATTR VkResult VKAPI_CALL vkgl_CreateSamplerYcbcrConversionKHR(
+   VkDevice, const VkSamplerYcbcrConversionCreateInfo *, const VkAllocationCallbacks *, VkSamplerYcbcrConversionKHR *out) {
+   if (out) *out = VK_NULL_HANDLE;
+   return VK_ERROR_FORMAT_NOT_SUPPORTED; // dependency-only, no YUV format is advertised
+}
+static VKAPI_ATTR void VKAPI_CALL vkgl_DestroySamplerYcbcrConversionKHR(
+   VkDevice, VkSamplerYcbcrConversionKHR, const VkAllocationCallbacks *) {}
 static VKAPI_ATTR void VKAPI_CALL vkgl_DestroyBufferView(void *a1, ...) { (void)a1; { } }
 static VKAPI_ATTR void VKAPI_CALL vkgl_DestroyDescriptorUpdateTemplate(void *a1, ...) { (void)a1; { } }
 static VKAPI_ATTR void VKAPI_CALL vkgl_DestroyPrivateDataSlot(void *a1, ...) { (void)a1; { } }
@@ -2704,6 +3031,12 @@ static const Entry g_entry_table[] = {
    FN(AllocateMemory), FN(FreeMemory), FN(MapMemory), FN(UnmapMemory),
    FN(FlushMappedMemoryRanges), FN(InvalidateMappedMemoryRanges),
    FN(GetBufferMemoryRequirements), FN(GetImageMemoryRequirements),
+   FN(GetBufferMemoryRequirements2KHR), FN(GetImageMemoryRequirements2KHR), FN(GetImageSparseMemoryRequirements2KHR),
+   FN(GetMemoryFdPropertiesKHR), FN(GetMemoryFdKHR), FN(GetImageDrmFormatModifierPropertiesEXT),
+   FN(CreateSamplerYcbcrConversionKHR), FN(DestroySamplerYcbcrConversionKHR),
+   {"vkBindBufferMemory2KHR", (void *)vkgl_BindBufferMemory2},
+   {"vkBindImageMemory2KHR", (void *)vkgl_BindImageMemory2},
+   {"vkTrimCommandPoolKHR", (void *)vkgl_TrimCommandPool},
    FN(CreateBuffer), FN(DestroyBuffer), FN(BindBufferMemory),
    FN(CreateImage), FN(DestroyImage), FN(BindImageMemory),
    FN(CreateImageView), FN(DestroyImageView), FN(CreateSampler), FN(DestroySampler),
@@ -2735,6 +3068,7 @@ static const Entry g_entry_table[] = {
    FN(GetPhysicalDeviceFeatures2), FN(GetPhysicalDeviceFormatProperties2),
    FN(GetPhysicalDeviceImageFormatProperties2), FN(GetPhysicalDeviceQueueFamilyProperties2),
    FN(GetPhysicalDeviceMemoryProperties2), FN(GetPhysicalDeviceSparseImageFormatProperties2),
+   {"vkGetPhysicalDeviceExternalBufferPropertiesKHR", (void *)vkgl_GetPhysicalDeviceExternalBufferProperties},
    FN(GetPhysicalDeviceExternalBufferProperties), FN(GetPhysicalDeviceExternalFenceProperties),
    FN(GetPhysicalDeviceExternalSemaphoreProperties),
    {"vkGetPhysicalDeviceFeatures2KHR", (void *)vkgl_GetPhysicalDeviceFeatures2},
@@ -2820,6 +3154,11 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetPhysicalDeviceProcAddr(VkInsta
       "vkGetPhysicalDeviceMemoryProperties2", "vkGetPhysicalDeviceSparseImageFormatProperties2",
       "vkGetPhysicalDeviceExternalBufferProperties", "vkGetPhysicalDeviceExternalFenceProperties",
       "vkGetPhysicalDeviceExternalSemaphoreProperties", "vkGetPhysicalDeviceProperties2",
+       "vkGetPhysicalDeviceExternalBufferPropertiesKHR",
+       "vkGetPhysicalDeviceFeatures2KHR", "vkGetPhysicalDeviceProperties2KHR",
+       "vkGetPhysicalDeviceFormatProperties2KHR", "vkGetPhysicalDeviceImageFormatProperties2KHR",
+       "vkGetPhysicalDeviceQueueFamilyProperties2KHR", "vkGetPhysicalDeviceMemoryProperties2KHR",
+       "vkGetPhysicalDeviceSparseImageFormatProperties2KHR",
    };
    for (const char *n : pd_names)
       if (strcmp(n, name) == 0)
@@ -3485,13 +3824,97 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkgl_EnumeratePhysicalDeviceGroups(VkInsta
 }
 static VKAPI_ATTR void VKAPI_CALL vkgl_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f) {
    vkgl_GetPhysicalDeviceFeatures(pd, &f->features);
+   for (void *next = f->pNext; next;) {
+      auto *base = (VkBaseOutStructure *)next;
+      next = base->pNext;
+      if (base->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES)
+         ((VkPhysicalDeviceSamplerYcbcrConversionFeatures *)base)->samplerYcbcrConversion = VK_FALSE;
+   }
 }
+
 static VKAPI_ATTR void VKAPI_CALL vkgl_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice pd, VkFormat fmt,
                                                                            VkFormatProperties2 *p) {
    vkgl_GetPhysicalDeviceFormatProperties(pd, fmt, &p->formatProperties);
+   for (void *next = p->pNext; next;) {
+      auto *base = (VkBaseOutStructure *)next;
+      next = base->pNext;
+      if (base->sType == VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT) {
+         auto *list = (VkDrmFormatModifierPropertiesListEXT *)base;
+         if (!external_format_supported(fmt)) { list->drmFormatModifierCount = 0; continue; }
+         if (!list->pDrmFormatModifierProperties) { list->drmFormatModifierCount = 1; continue; }
+         if (list->drmFormatModifierCount > 0) {
+            list->pDrmFormatModifierProperties[0].drmFormatModifier = 0;
+            list->pDrmFormatModifierProperties[0].drmFormatModifierPlaneCount = 1;
+            list->pDrmFormatModifierProperties[0].drmFormatModifierTilingFeatures =
+               VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+            list->drmFormatModifierCount = 1;
+         }
+      } else if (base->sType == VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT) {
+         auto *list = (VkDrmFormatModifierPropertiesList2EXT *)base;
+         if (!external_format_supported(fmt)) { list->drmFormatModifierCount = 0; continue; }
+         if (!list->pDrmFormatModifierProperties) { list->drmFormatModifierCount = 1; continue; }
+         if (list->drmFormatModifierCount > 0) {
+            list->pDrmFormatModifierProperties[0].drmFormatModifier = 0;
+            list->pDrmFormatModifierProperties[0].drmFormatModifierPlaneCount = 1;
+            list->pDrmFormatModifierProperties[0].drmFormatModifierTilingFeatures =
+               VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT;
+            list->drmFormatModifierCount = 1;
+         }
+      }
+   }
 }
+
 static VKAPI_ATTR VkResult VKAPI_CALL vkgl_GetPhysicalDeviceImageFormatProperties2(
    VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2 *info, VkImageFormatProperties2 *p) {
+   const VkPhysicalDeviceExternalImageFormatInfo *external = nullptr;
+   const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *modifier = nullptr;
+   for (const void *next = info->pNext; next;) {
+      const auto *base = (const VkBaseInStructure *)next;
+      next = base->pNext;
+      if (base->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)
+         external = (const VkPhysicalDeviceExternalImageFormatInfo *)base;
+      else if (base->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT)
+         modifier = (const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *)base;
+   }
+   if (!external && modifier) {
+      if (modifier->drmFormatModifier != 0 || modifier->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+          modifier->queueFamilyIndexCount != 0)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      if (!external_image_combo_supported(info->format, info->type, info->tiling, info->usage,
+                                          info->flags, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                                          modifier->drmFormatModifier))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      return vkgl_GetPhysicalDeviceImageFormatProperties(pd, info->format, info->type, info->tiling,
+                                                         info->usage, info->flags, &p->imageFormatProperties);
+   }
+   if (external) {
+      uint64_t modifier_value = modifier ? modifier->drmFormatModifier : 0;
+      if (modifier && (modifier_value != 0 || modifier->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+                       modifier->queueFamilyIndexCount != 0))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      if (!external_image_combo_supported(info->format, info->type, info->tiling, info->usage,
+                                          info->flags, external->handleType, modifier_value))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      VkResult r = vkgl_GetPhysicalDeviceImageFormatProperties(
+         pd, info->format, info->type, info->tiling, info->usage, info->flags, &p->imageFormatProperties);
+      if (r != VK_SUCCESS) return r;
+      for (void *next = p->pNext; next;) {
+         auto *base = (VkBaseOutStructure *)next;
+         next = base->pNext;
+         if (base->sType == VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES) {
+            auto *out = (VkExternalImageFormatProperties *)base;
+            out->externalMemoryProperties.externalMemoryFeatures =
+               VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT;
+            out->externalMemoryProperties.exportFromImportedHandleTypes = 0;
+            out->externalMemoryProperties.compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+         } else if (base->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT) {
+            ((VkImageDrmFormatModifierPropertiesEXT *)base)->drmFormatModifier = modifier_value;
+         }
+      }
+      return VK_SUCCESS;
+   }
+   if (modifier || info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
    return vkgl_GetPhysicalDeviceImageFormatProperties(pd, info->format, info->type, info->tiling,
                                                       info->usage, info->flags, &p->imageFormatProperties);
 }
@@ -3514,7 +3937,7 @@ static VKAPI_ATTR void VKAPI_CALL vkgl_GetPhysicalDeviceSparseImageFormatPropert
 }
 static VKAPI_ATTR void VKAPI_CALL vkgl_GetPhysicalDeviceExternalBufferProperties(
    VkPhysicalDevice, const VkPhysicalDeviceExternalBufferInfo *, VkExternalBufferProperties *p) {
-   memset(p, 0, sizeof(*p));
+   memset(&p->externalMemoryProperties, 0, sizeof(p->externalMemoryProperties)); // external buffers unsupported
 }
 static VKAPI_ATTR void VKAPI_CALL vkgl_GetPhysicalDeviceExternalFenceProperties(
    VkPhysicalDevice, const VkPhysicalDeviceExternalFenceInfo *, VkExternalFenceProperties *p) {
@@ -3556,6 +3979,13 @@ static VKAPI_ATTR void VKAPI_CALL vkgl_GetImageSubresourceLayout(VkDevice, VkIma
    (void)sub;
    memset(layout, 0, sizeof(*layout));
    if (!im) return;
+   if (im->external_dmabuf) {
+      if (sub->aspectMask != VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT || sub->mipLevel != 0 || sub->arrayLayer != 0) return;
+      layout->offset = im->external_offset;
+      layout->size = im->external_size;
+      layout->rowPitch = im->external_row_pitch;
+      return;
+   }
    layout->rowPitch = (VkDeviceSize)im->extent.width * 4;
    layout->size = layout->rowPitch * im->extent.height;
 }

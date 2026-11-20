@@ -17,6 +17,13 @@ points or extension names.
   is pinned by `tests/source-sha256.txt`.
 - `experimental/external-dmabuf` is a separate candidate branch. It is not a
   production release; see its `EXTERNAL_DMABUF.md` before evaluating it.
+> **Candidate warning on this branch:** narrow external dma-buf import
+> functionality has been independently verified, but the measured workload
+> median was approximately 15.35% slower and it has not been released to
+> production. VPU/YUV/Vulkan Video, export, external synchronization, tiled
+> layouts, and full zero-copy are not included. Read
+> [EXTERNAL_DMABUF.md](EXTERNAL_DMABUF.md).
+
 - A clean compile and host unit tests do not prove GPU correctness, Vulkan
   conformance, performance, or production readiness.
 
